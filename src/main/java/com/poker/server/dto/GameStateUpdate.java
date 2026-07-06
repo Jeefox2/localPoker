@@ -8,13 +8,14 @@ import java.util.Map;
 @Data
 @AllArgsConstructor
 public class GameStateUpdate {
-    private int pot;                          // Банк
-    private int currentMaxBet;                // Максимальная ставка на улице
-    private List<Map<String, String>> tableCards; // Карты на столе (общие)
-    private List<PlayerInfo> players;         // Все игроки с их ставками и статусами
-    private String currentPlayerSessionId;    // ID того, чей сейчас ход
-    private String currentStage;              // PREFLOP, FLOP, TURN, RIVER, SHOWDOWN
-    private String message;                   // Текстовое сообщение (лог)
+    private int pot;
+    private int currentMaxBet;
+    private List<Map<String, String>> tableCards;
+    private List<PlayerInfo> players;
+    private String currentPlayerSessionId;
+    private String currentStage;
+    private String message;
+    private long turnStartTime;
 
     @Data
     @AllArgsConstructor
@@ -23,7 +24,7 @@ public class GameStateUpdate {
         private String name;
         private int balance;
         private int bet;
-        private boolean active;       // Ещё в раздаче (не сбросил)
-        private boolean connected;    // Физически подключен
+        private boolean active;
+        private boolean connected;
     }
 }

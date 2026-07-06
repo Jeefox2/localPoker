@@ -8,5 +8,6 @@ import java.util.Map;
 @Data
 @AllArgsConstructor
 public class PlayerHandUpdate {
-    private List<Map<String, String>> cards; // Карты конкретного игрока
+    private List<Map<String, String>> cards;
+    private String handName;
 }

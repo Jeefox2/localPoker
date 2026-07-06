@@ -12,16 +12,35 @@ import org.springframework.messaging.simp.SimpMessageHeaderAccessor;
 import org.springframework.messaging.simp.SimpMessagingTemplate;
 import org.springframework.stereotype.Controller;
 
+import jakarta.annotation.PostConstruct;
 import java.util.*;
+import java.util.concurrent.*;
 
 @Controller
 public class PokerWebSocketController {
     private final PokerGameService gameService;
     private final SimpMessagingTemplate messagingTemplate;
+    private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(1);
 
     public PokerWebSocketController(PokerGameService gameService, SimpMessagingTemplate messagingTemplate) {
         this.gameService = gameService;
         this.messagingTemplate = messagingTemplate;
+    }
+
+    @PostConstruct
+    public void init() {
+        gameService.setOnAutoFoldCallback(() -> {
+            Player currentPlayer = gameService.getTable().getCurrentPlayer();
+            if (currentPlayer != null) {
+                gameService.handlePlayerAction(
+                        currentPlayer.getSessionId(),
+                        PlayerAction.FOLD,
+                        0
+                );
+                broadcastGameState("⏰ " + currentPlayer.getName() + " не успел сделать ход — авто-FOLD");
+                sendPrivateCardsToAll();
+            }
+        });
     }
 
     @MessageMapping("/action")
@@ -30,24 +49,39 @@ public class PokerWebSocketController {
         Player player = gameService.getPlayerBySessionId(sessionId);
         if (player == null) return;
 
-        // Запоминаем текущую стадию до действия
         PokerTable.GameStage stageBefore = gameService.getTable().getCurrentStage();
-
-        // Вызываем движок
         String result = gameService.handlePlayerAction(sessionId, request.getAction(), request.getAmount());
 
         if (!result.equals("OK")) {
-            // Ошибка — шлем только этому игроку на его личный топик
             messagingTemplate.convertAndSend(
                     "/topic/private-" + sessionId,
                     new ErrorMessage(result));
             return;
         }
 
-        // Успех — рассылаем обновленное состояние всем
+        // Проверяем, есть ли результат вскрытия
+        ShowdownUpdate showdown = gameService.consumePendingShowdown();
+        if (showdown != null) {
+            // Рассылаем состояние SHOWDOWN всем
+            broadcastGameState("Вскрытие! " + showdown.getWinnerMessage());
+            // Рассылаем вскрытие всем
+            messagingTemplate.convertAndSend("/topic/showdown", showdown);
+
+            // Через 5 секунд начинаем новый раунд
+            scheduler.schedule(() -> {
+                try {
+                    gameService.startNewRound();
+                    broadcastGameState("Новый раунд начался!");
+                    sendPrivateCardsToAll();
+                } catch (Exception e) {
+                    e.printStackTrace();
+                }
+            }, 5, TimeUnit.SECONDS);
+            return;
+        }
+
         broadcastGameState("Игрок " + player.getName() + " выполнил: " + request.getAction());
 
-        // Если перешли к новой улице — рассылаем новые карты
         PokerTable.GameStage stageAfter = gameService.getTable().getCurrentStage();
         if (stageBefore != stageAfter) {
             sendPrivateCardsToAll();
@@ -61,7 +95,6 @@ public class PokerWebSocketController {
 
         PokerTable table = gameService.getTable();
 
-        // Считаем игроков с фишками
         long playersWithChips = table.getPlayers().stream()
                 .filter(p -> p.getBalance() > 0)
                 .count();
@@ -81,10 +114,15 @@ public class PokerWebSocketController {
     private void broadcastGameState(String logMessage) {
         PokerTable table = gameService.getTable();
 
+        // УБРАЛИ вычисление комбинаций — они приватные!
         List<GameStateUpdate.PlayerInfo> playersInfo = table.getPlayers().stream()
                 .map(p -> new GameStateUpdate.PlayerInfo(
-                        p.getSessionId(), p.getName(), p.getBalance(),
-                        p.getBet(), p.isActive(), p.isConnected()))
+                        p.getSessionId(),
+                        p.getName(),
+                        p.getBalance(),
+                        p.getBet(),
+                        p.isActive(),
+                        p.isConnected()))
                 .toList();
 
         List<Map<String, String>> tableCards = table.getTableCards().stream()
@@ -101,7 +139,8 @@ public class PokerWebSocketController {
                 playersInfo,
                 currentPlayerId,
                 table.getCurrentStage() != null ? table.getCurrentStage().name() : "WAITING",
-                logMessage
+                logMessage,
+                table.getTurnStartTime()
         );
 
         messagingTemplate.convertAndSend("/topic/game", update);
@@ -113,10 +152,19 @@ public class PokerWebSocketController {
             List<Map<String, String>> cards = player.getHand().stream()
                     .map(this::cardToMap)
                     .toList();
-            // Шлем на персональный топик этого игрока
+
+            // НОВОЕ: вычисляем комбинацию для этого игрока
+            String handName = null;
+            if (!player.getHand().isEmpty()) {
+                handName = gameService.evaluateHandName(
+                        player.getHand(),
+                        table.getTableCards()
+                );
+            }
+
             messagingTemplate.convertAndSend(
                     "/topic/private-" + player.getSessionId(),
-                    new PlayerHandUpdate(cards));
+                    new PlayerHandUpdate(cards, handName));
         }
     }
 

@@ -1,5 +1,6 @@
 package com.poker.server.service;
 
+import com.poker.server.dto.ShowdownUpdate;
 import com.poker.server.model.Card;
 import com.poker.server.model.Player;
 import com.poker.server.model.PlayerAction;
@@ -8,14 +9,27 @@ import com.poker.server.model.PokerTable.GameStage;
 import org.springframework.stereotype.Service;
 
 import java.util.*;
+import java.util.concurrent.*;
 
 @Service
 public class PokerGameService {
     private final HandEvaluatorService handEvaluator;
-    private final PokerTable table = new PokerTable("main-table");
+    private final PokerTable table = new PokerTable();
+
+    // Showdown
+    private ShowdownUpdate pendingShowdown = null;
+
+    // Таймер хода
+    private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(1);
+    private ScheduledFuture<?> turnTimerTask = null;
+    private Runnable onAutoFoldCallback = null;
 
     public PokerGameService(HandEvaluatorService handEvaluator) {
         this.handEvaluator = handEvaluator;
+    }
+
+    public void setOnAutoFoldCallback(Runnable callback) {
+        this.onAutoFoldCallback = callback;
     }
 
     // ========== УПРАВЛЕНИЕ ИГРОКАМИ ==========
@@ -23,6 +37,15 @@ public class PokerGameService {
         Player player = new Player(sessionId, name);
         table.getPlayers().add(player);
         return player;
+    }
+
+    // НОВОЕ: публичный метод для получения названия комбинации
+    public String evaluateHandName(List<Card> hand, List<Card> tableCards) {
+        if (hand == null || hand.isEmpty()) {
+            return null;
+        }
+        HandEvaluatorService.HandResult result = handEvaluator.evaluate(hand, tableCards);
+        return result.getName();
     }
 
     public Player getPlayerBySessionId(String sessionId) {
@@ -36,14 +59,21 @@ public class PokerGameService {
         return table;
     }
 
+    public synchronized ShowdownUpdate consumePendingShowdown() {
+        ShowdownUpdate update = pendingShowdown;
+        pendingShowdown = null;
+        return update;
+    }
+
     // ========== РАЗДАЧА И РАУНДЫ ==========
     public synchronized void startNewRound() {
+        cancelTurnTimer(); // Отменяем предыдущий таймер
+
         table.getTableCards().clear();
         table.setPot(0);
         table.setCurrentMaxBet(0);
         table.setCurrentStage(GameStage.PREFLOP);
 
-        // Проверяем, сколько игроков с фишками осталось
         long playersWithChips = table.getPlayers().stream()
                 .filter(p -> p.getBalance() > 0)
                 .count();
@@ -52,13 +82,11 @@ public class PokerGameService {
             return;
         }
 
-        // Сдвигаем дилера ТОЛЬКО среди игроков с фишками
         int newDealerIndex = getNextPlayerWithChips(table.getDealerIndex());
         table.setDealerIndex(newDealerIndex);
 
         createDeck();
 
-        // Сбрасываем состояние игроков
         for (Player p : table.getPlayers()) {
             if (p.getBalance() > 0) {
                 p.setActive(true);
@@ -76,10 +104,12 @@ public class PokerGameService {
         dealCards();
         postBlinds();
 
-        // Ход у игрока слева от BB
         int bbIndex = getNextPlayerWithChips(table.getDealerIndex());
         bbIndex = getNextPlayerWithChips(bbIndex);
         table.setCurrentPlayerIndex(getNextPlayerWithChips(bbIndex));
+
+        // Запускаем таймер для первого игрока
+        startTurnTimer();
     }
 
     private int getNextPlayerWithChips(int currentIndex) {
@@ -118,6 +148,9 @@ public class PokerGameService {
     }
 
     private Card drawCard() {
+        if (table.getDeck().isEmpty()) {
+            createDeck();
+        }
         return table.getDeck().removeFirst();
     }
 
@@ -172,15 +205,16 @@ public class PokerGameService {
             return validationError;
         }
 
+        // Отменяем таймер перед обработкой действия
+        cancelTurnTimer();
+
         player.setHasActed(true);
         switch (action) {
             case FOLD -> {
                 player.setActive(false);
                 player.clearHand();
             }
-            case CHECK -> {
-                // Ничего не делаем
-            }
+            case CHECK -> {}
             case CALL -> {
                 int needToPay = table.getCurrentMaxBet() - player.getBet();
                 if (needToPay > player.getBalance()) needToPay = player.getBalance();
@@ -196,10 +230,16 @@ public class PokerGameService {
                 updateMaxBet(amount, player);
             }
             case ALL_IN -> {
-                contributeToPot(player.getBalance());
-                player.setBet(player.getBet() + player.getBalance());
-                updateMaxBet(player.getBet(), player);
+                int allInAmount = player.getBalance();
+                contributeToPot(allInAmount);
+                int newTotalBet = player.getBet() + allInAmount;
+                player.setBet(newTotalBet);
                 player.setBalance(0);
+                if (newTotalBet > table.getCurrentMaxBet()) {
+                    updateMaxBet(newTotalBet, player);
+                } else {
+                    player.setHasActed(true);
+                }
             }
         }
 
@@ -229,43 +269,60 @@ public class PokerGameService {
 
     // ========== ЛОГИКА ХОДОВ ==========
     private void nextTurn() {
-        // Считаем активных игроков С ФИШКАМИ
+        // 1. Считаем ВСЕХ активных игроков (включая All-In)
         long activeCount = table.getPlayers().stream()
-                .filter(p -> p.isActive() && p.getBalance() > 0)
+                .filter(Player::isActive)
                 .count();
 
-        // Если остался один активный игрок с фишками — он забирает банк
+        // 2. Если остался ОДИН активный — все остальные сбросили, он забирает банк
         if (activeCount == 1) {
             Player winner = table.getPlayers().stream()
-                    .filter(p -> p.isActive() && p.getBalance() > 0)
+                    .filter(Player::isActive)
                     .findFirst()
                     .orElse(null);
             if (winner != null) {
                 winner.setBalance(winner.getBalance() + table.getPot());
                 table.setPot(0);
             }
+            startNewRound();
             return;
         }
 
-        // Если круг торгов завершен — переходим к следующей улице
+        // 3. Считаем активных игроков С ФИШКАМИ
+        long activeWithChipsCount = table.getPlayers().stream()
+                .filter(p -> p.isActive() && p.getBalance() > 0)
+                .count();
+
+        // 4. Если все активные в All-In — досдаём карты до SHOWDOWN
+        if (activeWithChipsCount <= 1) {
+            while (table.getCurrentStage() != GameStage.SHOWDOWN) {
+                advanceRound();
+            }
+            // НЕ запускаем таймер — после SHOWDOWN контроллер сам всё обработает
+            return;
+        }
+
+        // 5. Если текущий игрок не имеет фишек, ищем следующего
+        if (table.getCurrentPlayer() != null && table.getCurrentPlayer().getBalance() == 0) {
+            int nextIndex = getNextPlayerWithChips(table.getCurrentPlayerIndex());
+            table.setCurrentPlayerIndex(nextIndex);
+        }
+
+        // 6. Если круг торгов завершен — переходим к следующей улице
         if (isBettingRoundFinished()) {
             advanceRound();
             table.setCurrentPlayerIndex(getFirstActivePlayerWithChipsIndex());
         } else {
-            // Ищем следующего активного игрока С ФИШКАМИ
-            int startIndex = table.getCurrentPlayerIndex();
-            do {
-                table.setCurrentPlayerIndex((table.getCurrentPlayerIndex() + 1) % table.getPlayers().size());
-                if (table.getCurrentPlayerIndex() == startIndex) {
-                    break;
-                }
-            } while (!table.getCurrentPlayer().isActive() || table.getCurrentPlayer().getBalance() == 0);
+            int nextIndex = getNextPlayerWithChips(table.getCurrentPlayerIndex());
+            table.setCurrentPlayerIndex(nextIndex);
         }
+
+        // 7. Запускаем таймер для следующего игрока
+        startTurnTimer();
     }
 
     private boolean isBettingRoundFinished() {
         for (Player p : table.getPlayers()) {
-            // Игнорируем игроков без фишек (All-In) и сбросивших
             if (p.isActive() && p.getBalance() > 0) {
                 if (p.getBet() != table.getCurrentMaxBet() || !p.isHasActed()) {
                     return false;
@@ -286,6 +343,10 @@ public class PokerGameService {
     }
 
     private void advanceRound() {
+        if (table.getCurrentStage() == GameStage.SHOWDOWN) {
+            return;
+        }
+
         for (Player p : table.getPlayers()) {
             p.setBet(0);
             p.setHasActed(false);
@@ -322,10 +383,13 @@ public class PokerGameService {
     private void determineWinner() {
         List<Player> winners = new ArrayList<>();
         HandEvaluatorService.HandResult bestHand = null;
+        Map<String, String> playerHands = new HashMap<>();
 
         for (Player player : table.getPlayers()) {
             if (!player.isActive()) continue;
             HandEvaluatorService.HandResult result = handEvaluator.evaluate(player.getHand(), table.getTableCards());
+            playerHands.put(player.getName(), result.getName());
+
             if (bestHand == null) {
                 bestHand = result;
                 winners.add(player);
@@ -341,6 +405,41 @@ public class PokerGameService {
             }
         }
 
+        // Карты всех активных игроков
+        Map<String, List<Map<String, String>>> playersCards = new HashMap<>();
+        for (Player player : table.getPlayers()) {
+            if (!player.isActive()) continue;
+            List<Map<String, String>> cards = player.getHand().stream()
+                    .map(this::cardToMap)
+                    .toList();
+            playersCards.put(player.getName(), cards);
+        }
+
+        List<String> winnerNames = winners.stream()
+                .map(Player::getName)
+                .toList();
+
+        String winnerMessage;
+        if (winners.size() == 1) {
+            Player winner = winners.get(0);
+            winnerMessage = String.format("🏆 Победил %s с комбинацией %s!",
+                    winner.getName(), bestHand.getName());
+        } else {
+            String winnerNamesStr = String.join(", ", winnerNames);
+            winnerMessage = String.format("🤝 Ничья между: %s! Банк разделён. Комбинация: %s",
+                    winnerNamesStr, bestHand.getName());
+        }
+
+        // Сохраняем результат вскрытия
+        pendingShowdown = new ShowdownUpdate(
+                playersCards,
+                playerHands,
+                table.getTableCards().stream().map(this::cardToMap).toList(),
+                winnerNames,
+                winnerMessage
+        );
+
+        // Раздаём банк
         if (!winners.isEmpty()) {
             int share = table.getPot() / winners.size();
             int remainder = table.getPot() % winners.size();
@@ -352,6 +451,44 @@ public class PokerGameService {
             table.setPot(0);
         }
 
-        startNewRound();
+        // ВАЖНО: НЕ вызываем startNewRound() здесь!
+        // Это сделает контроллер после рассылки ShowdownUpdate и паузы 5 секунд
+    }
+
+    // ========== ТАЙМЕР ХОДА ==========
+    private void startTurnTimer() {
+        cancelTurnTimer();
+        table.setTurnStartTime(System.currentTimeMillis());
+
+        turnTimerTask = scheduler.schedule(() -> {
+            try {
+                autoFoldCurrentPlayer();
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+        }, PokerTable.TURN_TIME_LIMIT_MS, TimeUnit.MILLISECONDS);
+    }
+
+    private void cancelTurnTimer() {
+        if (turnTimerTask != null && !turnTimerTask.isDone()) {
+            turnTimerTask.cancel(false);
+            turnTimerTask = null;
+        }
+    }
+
+    private void autoFoldCurrentPlayer() {
+        Player currentPlayer = table.getCurrentPlayer();
+        if (currentPlayer != null && currentPlayer.isActive() && currentPlayer.getBalance() > 0) {
+            if (onAutoFoldCallback != null) {
+                onAutoFoldCallback.run();
+            }
+        }
+    }
+
+    private Map<String, String> cardToMap(Card card) {
+        Map<String, String> map = new HashMap<>();
+        map.put("rank", card.getRank());
+        map.put("suit", card.getSuit());
+        return map;
     }
 }
