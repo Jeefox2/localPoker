@@ -1,0 +1,100 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Poker Server Test Client</title>
+  <script src="https://cdn.jsdelivr.net/npm/sockjs-client@1/dist/sockjs.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/stompjs@2.3.3/lib/stomp.min.js"></script>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 1rem; }
+    #logs { white-space: pre-wrap; border: 1px solid #ddd; padding: .5rem; height: 300px; overflow: auto; }
+    .row { margin: .5rem 0; }
+  </style>
+</head>
+<body>
+<h2>Poker Server — Test STOMP Client</h2>
+<div class="row">
+  <button id="connectBtn" onclick="connect()">Connect</button>
+  <button onclick="disconnect()">Disconnect</button>
+</div>
+<div class="row">
+  <input id="name" placeholder="Player name" value="Tester" />
+  <button onclick="sendJoin()">Join</button>
+</div>
+<div class="row">
+  <input id="raiseAmount" type="number" placeholder="amount" value="100" />
+  <button onclick="sendAction('FOLD')">Fold</button>
+  <button onclick="sendAction('CHECK')">Check</button>
+  <button onclick="sendAction('CALL')">Call</button>
+  <button onclick="sendAction('RAISE')">Raise</button>
+  <button onclick="sendAction('ALL_IN')">All-in</button>
+</div>
+<div class="row">
+  <strong>Logs</strong>
+  <div id="logs"></div>
+</div>
+<script>
+  let stompClient = null;
+  let myName = null;
+  let mySessionId = null;
+
+  function log(msg) {
+    const el = document.getElementById('logs');
+    el.textContent = (new Date()).toISOString() + '  ' + msg + '\n' + el.textContent;
+  }
+
+  function connect() {
+    const socket = new SockJS('/ws');
+    stompClient = Stomp.Stomp.over(socket);
+    stompClient.connect({}, function(frame) {
+      log('Connected: ' + frame);
+      // subscribe to public game state
+      stompClient.subscribe('/topic/game', function(message) {
+        log('[/topic/game] ' + message.body);
+        try {
+          const gs = JSON.parse(message.body);
+          if (gs.players && myName && !mySessionId) {
+            const me = gs.players.find(p => p.name === myName);
+            if (me && me.sessionId) {
+              mySessionId = me.sessionId;
+              log('Detected my sessionId: ' + mySessionId);
+              stompClient.subscribe('/topic/private-' + mySessionId, function(m) {
+                log('[private] ' + m.body);
+              });
+            }
+          }
+        } catch (e) {
+          // ignore
+        }
+      });
+      // also subscribe to /user/queue if needed (server doesn't use /user in current impl)
+    }, function(error) {
+      log('Connect error: ' + error);
+    });
+  }
+
+  function disconnect() {
+    if (stompClient) stompClient.disconnect();
+    stompClient = null;
+    log('Disconnected');
+  }
+
+  function sendJoin() {
+    const name = document.getElementById('name').value;
+    myName = name;
+    if (!stompClient) { log('Not connected'); return; }
+    stompClient.send('/app/join', {}, name);
+    log('Sent join: ' + name);
+  }
+
+  function sendAction(action) {
+    if (!stompClient) { log('Not connected'); return; }
+    const amount = parseInt(document.getElementById('raiseAmount').value) || 0;
+    const payload = { action: action, amount: amount };
+    stompClient.send('/app/action', {}, JSON.stringify(payload));
+    log('Sent action: ' + JSON.stringify(payload));
+  }
+</script>
+</body>
+</html>
+
