@@ -31,3 +31,15 @@ build/
 
 ### VS Code ###
 .vscode/
+
+# OS / editor temp files
+.DS_Store
+*.log
+*.class
+
+# Java artifacts
+*.jar
+
+# environment
+.env
+
